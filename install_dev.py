@@ -5,21 +5,22 @@ import sys
 
 def install_torch_nightly_deps():
     """Install torch related dependencies from pinned nightly"""
-    EXECUTORCH_NIGHTLY_VERSION = "dev20251003"
-    TORCHAO_NIGHTLY_VERSION = "dev20251104"
+    EXECUTORCH_NIGHTLY_VERSION = "dev20260104"
+    TORCHAO_NIGHTLY_VERSION = "dev20251222"
     # Torch nightly is aligned with pinned nightly in https://github.com/pytorch/executorch/blob/main/torch_pin.py#L2
-    TORCH_NIGHTLY_VERSION = "dev20251104"
+    TORCH_NIGHTLY_VERSION = "dev20251222"
     subprocess.check_call(
         [
             sys.executable,
             "-m",
             "pip",
             "install",
+            "--no-cache-dir",  # Prevent cached CUDA packages
             f"executorch==1.1.0.{EXECUTORCH_NIGHTLY_VERSION}",
-            f"torch==2.10.0.{TORCH_NIGHTLY_VERSION}",
+            f"torch==2.11.0.{TORCH_NIGHTLY_VERSION}",
             f"torchvision==0.25.0.{TORCH_NIGHTLY_VERSION}",
             f"torchaudio==2.10.0.{TORCH_NIGHTLY_VERSION}",
-            f"torchao==0.15.0.{TORCHAO_NIGHTLY_VERSION}",
+            f"torchao==0.16.0.{TORCHAO_NIGHTLY_VERSION}",
             "--extra-index-url",
             "https://download.pytorch.org/whl/nightly/cpu",
         ]
@@ -34,7 +35,7 @@ def install_dep_from_source():
             "-m",
             "pip",
             "install",
-            "git+https://github.com/huggingface/transformers@91393fe4cc3266a05bc0d129e34ff5f761bb46e2#egg=transformers",  # 4.56.1
+            "git+https://github.com/huggingface/transformers@bdc85cb85c8772d37aa29ce447860b44d7fad6ef#egg=transformers",  # v5.0.0rc0
         ]
     )
     subprocess.check_call(
@@ -58,12 +59,12 @@ def main():
     )
     args = parser.parse_args()
 
-    # Install package with dev extras
-    subprocess.check_call([sys.executable, "-m", "pip", "install", ".[dev]"])
-
-    # Install nightly dependencies
+    # Install nightly torch dependencies FIRST to avoid pulling CUDA versions
     if not args.skip_override_torch:
         install_torch_nightly_deps()
+
+    # Install package with dev extras
+    subprocess.check_call([sys.executable, "-m", "pip", "install", ".[dev]"])
 
     # Install source dependencies
     install_dep_from_source()

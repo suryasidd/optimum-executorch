@@ -22,7 +22,6 @@ from torch.nn.attention import SDPBackend
 from transformers import (
     AutoConfig,
     AutoProcessor,
-    DynamicCache,
     EncoderDecoderCache,
     PreTrainedModel,
     StaticCache,
@@ -31,12 +30,12 @@ from transformers import (
 )
 from transformers.integrations.executorch import (
     TorchExportableModuleForDecoderOnlyLM,
-    sdpa_mask_without_vmap,
 )
 from transformers.masking_utils import AttentionMaskInterface
 from transformers.modeling_utils import AttentionInterface
 
-from optimum.executorch.attentions.custom_sdpa import get_custom_sdpa_for_ring_kv_cache
+from optimum.executorch.attentions.custom_sdpa import get_custom_sdpa_for_ring_kv_cache, sdpa_mask_passthrough
+from optimum.executorch.attentions.whisper_attention import WhisperCrossAttention
 
 from .utils import apply_chat_template_with_fallback, save_config_to_constant_methods
 
@@ -177,7 +176,7 @@ class MultiModalTextToTextExportableModule(torch.nn.Module):
     Args:
         model (torch.nn.Module): The multimodal model to export.
         modality (str): The input modality type ("audio" or "vision").
-        encoder_name (str): Name of the encoder attribute in the model.
+        encoder_model (str): The encoder model within the mutlimodal model.
         processor_config (dict, optional): Preprocessor configuration loaded from preprocessor_config.json.
         use_custom_kv_cache (bool): Whether to use custom key-value caching for optimization.
         use_custom_sdpa (bool): Whether to use custom scaled dot-product attention.
@@ -187,7 +186,7 @@ class MultiModalTextToTextExportableModule(torch.nn.Module):
         self,
         model: torch.nn.Module,
         modality: str,
-        encoder_name: str,
+        encoder_model: torch.nn.Module,
         max_seq_len: int,
         processor_config: dict = None,
         use_custom_kv_cache: bool = False,
@@ -195,13 +194,10 @@ class MultiModalTextToTextExportableModule(torch.nn.Module):
     ):
         super().__init__()
 
-        if not hasattr(model, encoder_name):
-            raise ValueError(f'Model does not contain encoder "{encoder_name}".')
-
         self.model = model
         self.config = model.config
         self.modality = modality
-        self.encoder_name = encoder_name
+        self.encoder_model = encoder_model
         self.processor_config = processor_config
         self.use_custom_kv_cache = use_custom_kv_cache
         self.use_custom_sdpa = use_custom_sdpa
@@ -212,7 +208,7 @@ class MultiModalTextToTextExportableModule(torch.nn.Module):
             additional_metadata_kwargs[f"{modality}_token_id"] = getattr(self.config, "image_token_id")
         self.metadata = save_config_to_constant_methods(
             config=model.config.text_config,
-            generation_config=model.generation_config,
+            generation_config=getattr(model, "generation_config", None),
             processor_config=processor_config,
             get_max_seq_len=max_seq_len,
             **additional_metadata_kwargs,
@@ -269,7 +265,7 @@ class MultiModalTextToTextExportableModule(torch.nn.Module):
         if self.use_custom_sdpa:
             if self.use_custom_kv_cache:
                 AttentionInterface.register("custom_sdpa_ring_kv_cache", _custom_sdpa_for_ring_kv_cache)
-                AttentionMaskInterface.register("custom_sdpa_ring_kv_cache", sdpa_mask_without_vmap)
+                AttentionMaskInterface.register("custom_sdpa_ring_kv_cache", sdpa_mask_passthrough)
                 # Manually set the attention implementation to custom_sdpa_ring_kv_cache
                 # This handles both regular sdpa and one for sliding window/local attention
                 exportable_module.model.model.config._attn_implementation = "custom_sdpa_ring_kv_cache"
@@ -371,7 +367,7 @@ class MultiModalTextToTextExportableModule(torch.nn.Module):
 
             # 3. Export encoder.
             if self.use_custom_sdpa:
-                getattr(self.model, self.encoder_name).config._attn_implementation = "custom_sdpa"
+                self.encoder_model.config._attn_implementation = "custom_sdpa"
 
             if self.modality == "audio":
                 encoder = AudioExportableModule(self.model)
@@ -425,7 +421,7 @@ class CausalLMExportableModule(torch.nn.Module):
         self.disable_dynamic_shapes = disable_dynamic_shapes
         self.metadata = save_config_to_constant_methods(
             model.config,
-            model.generation_config,
+            generation_config=getattr(model, "generation_config", None),
             get_max_seq_len=max_seq_len,
             enable_dynamic_shape=not self.disable_dynamic_shapes,
         )
@@ -455,7 +451,7 @@ class CausalLMExportableModule(torch.nn.Module):
 
         if not self.disable_dynamic_shapes and not is_using_hybrid_cache_wo_custom_sdpa_kv_cache:
             # Prepare inputs with dynamic shapes
-            seq_length = 3  # Sequence length > 1 to avoid specialization issues
+            seq_length = 3  # Sequence length > 1 to avoid specialization issue
             example_input_ids = torch.zeros((1, seq_length), dtype=torch.long, device=self.model.device)
             example_cache_position = torch.arange(seq_length, dtype=torch.long, device=self.model.device)
             max_seq_len = self.metadata.get("get_max_seq_len")
@@ -471,7 +467,6 @@ class CausalLMExportableModule(torch.nn.Module):
         return example_input_ids, example_cache_position, dynamic_shapes, strict
 
     def _register_custom_attention(self, exportable_module: torch.nn.Module):
-        from transformers.integrations.executorch import sdpa_mask_without_vmap
         from transformers.masking_utils import AttentionMaskInterface
         from transformers.modeling_utils import AttentionInterface
 
@@ -479,7 +474,7 @@ class CausalLMExportableModule(torch.nn.Module):
             if self.use_custom_kv_cache:
                 _custom_sdpa_for_ring_kv_cache = get_custom_sdpa_for_ring_kv_cache(exportable_module)
                 AttentionInterface.register("custom_sdpa_ring_kv_cache", _custom_sdpa_for_ring_kv_cache)
-                AttentionMaskInterface.register("custom_sdpa_ring_kv_cache", sdpa_mask_without_vmap)
+                AttentionMaskInterface.register("custom_sdpa_ring_kv_cache", sdpa_mask_passthrough)
                 # Manually set the attention implementation to custom_sdpa_ring_kv_cache
                 # This handles both regular sdpa and one for sliding window/local attention
                 exportable_module.model.model.config._attn_implementation = "custom_sdpa_ring_kv_cache"
@@ -554,7 +549,7 @@ class VisionEncoderExportableModule(torch.nn.Module):
         self.model = model
         self.config = model.config
         # Metadata to be recorded in the pte model file
-        self.metadata = save_config_to_constant_methods(model.config, model.generation_config)
+        self.metadata = save_config_to_constant_methods(model.config, getattr(model, "generation_config", None))
 
     def forward(self, pixel_values):
         print(f"DEBUG: pixel_values: {pixel_values.shape}")
@@ -593,7 +588,7 @@ class MaskedLMExportableModule(torch.nn.Module):
         self.model = model
         self.config = model.config
         # Metadata to be recorded in the pte model file
-        self.metadata = save_config_to_constant_methods(model.config, model.generation_config)
+        self.metadata = save_config_to_constant_methods(model.config, getattr(model, "generation_config", None))
 
     def forward(self, input_ids, attention_mask):
         return self.model(input_ids, attention_mask)
@@ -683,11 +678,30 @@ class Seq2SeqLMDecoderExportableModuleWithStaticCache(torch.nn.Module):
         self.self_attention_cache.early_initialization(batch_size, num_heads, head_dim, model.dtype, model.device)
 
         # Initialize cross attention cache
-        self.dynamic_cache = DynamicCache(config=self.config)
-        self.cache = EncoderDecoderCache(self.self_attention_cache, self.dynamic_cache)
+        cross_attention_heads = getattr(
+            self.config, "decoder_attention_heads", getattr(self.config, "num_attention_heads", None)
+        )
+        if cross_attention_heads is None:
+            raise ValueError("Unable to determine decoder attention heads for cross-attention cache.")
+        hidden_size = getattr(self.config, "hidden_size", getattr(self.config, "d_model", None))
+        if hidden_size is None:
+            raise ValueError("Unable to determine hidden size for cross-attention cache allocation.")
+        cross_head_dim = getattr(self.config, "head_dim", hidden_size // cross_attention_heads)
+
+        self.cross_attention_cache = StaticCache(
+            config=self.config,
+            max_batch_size=batch_size,
+            max_cache_len=getattr(
+                self.config, "max_source_positions", max_static_cache_length
+            ),  # This is fixed in whisper
+            device=model.device,
+            dtype=model.dtype,
+        )
+        self.cross_attention_cache.early_initialization(
+            batch_size, cross_attention_heads, cross_head_dim, model.dtype, model.device
+        )
 
         # Register cache buffers to make them exportable.
-        # Cross attention cache buffer is not registered since it's not actually being used atm.
         for i in range(len(self.self_attention_cache)):
             self.register_buffer(
                 f"self_attention_key_cache_{i}", self.self_attention_cache.layers[i].keys, persistent=False
@@ -695,6 +709,41 @@ class Seq2SeqLMDecoderExportableModuleWithStaticCache(torch.nn.Module):
             self.register_buffer(
                 f"self_attention_value_cache_{i}", self.self_attention_cache.layers[i].values, persistent=False
             )
+        for i in range(len(self.cross_attention_cache)):
+            self.register_buffer(
+                f"cross_attention_key_cache_{i}", self.cross_attention_cache.layers[i].keys, persistent=False
+            )
+            self.register_buffer(
+                f"cross_attention_value_cache_{i}", self.cross_attention_cache.layers[i].values, persistent=False
+            )
+        # self.register_buffer(
+        #     "cross_attention_cache_initialized", torch.zeros(batch_size, 1, dtype=torch.bool), persistent=False
+        # )
+        # Add a flag to indicate if the cache has been initialized.
+        # Initialize it as False on CPU so it can be used as a predicate in torch.cond.
+        # After the first forward pass, we'll set it to True to indicate the cache is populated.
+        # self.cross_attention_cache._initialized = self.cross_attention_cache_initialized
+
+        self.cache = EncoderDecoderCache(self.self_attention_cache, self.cross_attention_cache)
+        # Use custom cross attention for Whisper.
+        # Only use WhisperCrossAttention if torch.ops.executorch.alias is available and device is CUDA.
+        _has_et_alias = hasattr(torch.ops, "executorch") and hasattr(torch.ops.executorch, "alias")
+        _is_cuda = model.device.type == "cuda"
+        if isinstance(model, WhisperForConditionalGeneration) and _has_et_alias and _is_cuda:
+            for layer in self.decoder.layers:
+                cross_attn = WhisperCrossAttention(
+                    embed_dim=layer.encoder_attn.embed_dim,
+                    num_heads=layer.encoder_attn.num_heads,
+                    dropout=layer.encoder_attn.dropout,
+                    is_decoder=layer.encoder_attn.is_decoder,
+                    layer_idx=layer.encoder_attn.layer_idx,
+                    config=layer.encoder_attn.config,
+                ).to(dtype=model.dtype, device=model.device)
+                cross_attn.q_proj = layer.encoder_attn.q_proj
+                cross_attn.k_proj = layer.encoder_attn.k_proj
+                cross_attn.v_proj = layer.encoder_attn.v_proj
+                cross_attn.out_proj = layer.encoder_attn.out_proj
+                layer.encoder_attn = cross_attn
 
     def forward(self, decoder_input_ids, encoder_hidden_states, cache_position):
         # Get outputs from decoder
@@ -705,10 +754,22 @@ class Seq2SeqLMDecoderExportableModuleWithStaticCache(torch.nn.Module):
             use_cache=True,
             cache_position=cache_position,
         )
+        # Set the cross attention cache as initialized after the first forward pass
+        # This allows torch.cond to branch differently on subsequent runs
+        # self.cross_attention_cache_initialized.fill_(True)
 
         # Apply linear projection (lm head) to obtain logits
         logits = self.proj_out(outputs[0])
         return logits
+
+
+class ArgmaxExportableModule(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module):
+        super().__init__()
+        self.model = model
+
+    def forward(self, logits: torch.FloatTensor):
+        return torch.argmax(logits, dim=-1)
 
 
 class Seq2SeqLMExportableModule(torch.nn.Module):
@@ -806,6 +867,17 @@ class Seq2SeqLMExportableModule(torch.nn.Module):
 
         return exported_decoder
 
+    def _export_sampler(self, logits):
+        sampler = ArgmaxExportableModule(self.model).to(self.model.device).eval()
+        with torch.no_grad():
+            exported_sampler = torch.export.export(
+                sampler,
+                (logits,),
+                dynamic_shapes=None,
+                strict=True,
+            )
+        return exported_sampler
+
     def export(
         self,
         encoder_input_ids=None,
@@ -847,10 +919,27 @@ class Seq2SeqLMExportableModule(torch.nn.Module):
             example_cache_position,
         )
 
-        return {
+        # Skip sampler export for MPS + bfloat16 due to Metal shader compilation error
+        # (assigning float to bfloat in generated shader code)
+        is_mps_bfloat16 = str(self.model.device).startswith("mps") and self.model.dtype == torch.bfloat16
+        if is_mps_bfloat16:
+            logging.warning(
+                "Skipping sampler export for MPS + bfloat16 due to Metal shader compilation issues. "
+                "The runner will use CPU-based sampling instead."
+            )
+            self.exported_sampler = None
+        else:
+            self.exported_sampler = self._export_sampler(
+                torch.randn((1, 1, self.config.vocab_size), dtype=self.model.dtype, device=self.model.device)
+            )
+
+        result = {
             "encoder": self.exported_encoder,  # Not called "text_encoder" because the encoder could be non-text too, e.g. Whisper.
             "text_decoder": self.exported_decoder,
         }
+        if self.exported_sampler is not None:
+            result["sampler"] = self.exported_sampler
+        return result
 
     def generate(self, prompt_token_ids, max_new_tokens):
         with torch.no_grad():
