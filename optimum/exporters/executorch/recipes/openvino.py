@@ -15,6 +15,7 @@
 import logging
 from typing import Dict, Union
 
+import torch
 from tabulate import tabulate
 from torch.export import ExportedProgram
 
@@ -38,6 +39,36 @@ from ..integrations import (
     VisionEncoderExportableModule,
 )
 from ..recipe_registry import register_recipe
+
+
+def _apply_openvino_quantization(
+    exported_programs: Dict[str, ExportedProgram],
+    mode: str,
+    group_size: int = 128,
+) -> Dict[str, ExportedProgram]:
+    """
+    Apply OpenVINO weight-only quantization to exported program.
+
+    """
+    try:
+        from executorch.backends.openvino.quantizer import (
+            OpenVINOQuantizer,
+            QuantizationMode,
+        )
+    except:
+        raise ImportError("OpenVINO quantizer not found. Please install the required dependencies.")
+    quantizer_params = {}
+    quantizer_params["mode"] = QuantizationMode.INT4WO_SYM
+    quantizer_params["group_size"] = group_size
+    quantizer_params["ratio"] = 1
+
+    quantizer = OpenVINOQuantizer(**quantizer_params)
+
+    from executorch.backends.openvino.quantizer import apply_nncf_data_aware_compression
+
+    quantized_program = apply_nncf_data_aware_compression(exported_programs, quantizer, True, True)
+
+    return quantized_program
 
 
 @register_recipe("openvino")
@@ -106,9 +137,20 @@ def export_to_executorch_with_openvino(
 
     # Extract OpenVINO-specific parameters from kwargs
     device = kwargs.get("device", "CPU")
+
     enable_memory_planning = kwargs.get("enable_memory_planning", True)
+    openvino_quantization = kwargs.get("openvino_quantization", None)
+    openvino_group_size = kwargs.get("openvino_group_size", 128)
 
     exported_progs = model.export()
+
+    # Apply OpenVINO PT2E quantization if requested (post-export, NNCF-backed)
+    if openvino_quantization:
+        exported_progs = _apply_openvino_quantization(
+            exported_progs,
+            mode=openvino_quantization,
+            group_size=openvino_group_size,
+        )
 
     if (
         model.config._attn_implementation == "custom_sdpa"

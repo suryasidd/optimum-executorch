@@ -189,6 +189,23 @@ def parse_args_executorch(parser):
         required=False,
         help="Device to run the model on. Options: cpu, cuda, mps. Default: cpu.",
     )
+    required_group.add_argument(
+        "--openvino_quantization",
+        type=str,
+        choices=["int4wo_sym", "int4wo_asym", "int8wo_sym", "int8wo_asym"],
+        required=False,
+        help=(
+            "OpenVINO quantization config"
+            "Only valid when --recipe openvino. Mutually exclusive with --qlinear/--qembedding.\n"
+        ),
+    )
+    required_group.add_argument(
+        "--openvino_group_size",
+        type=int,
+        required=False,
+        default=128,
+        help="Group size for OpenVINO weight quantization (default: 128).",
+    )
 
 
 class ExecuTorchExportCommand(BaseOptimumCLICommand):
@@ -230,6 +247,17 @@ class ExecuTorchExportCommand(BaseOptimumCLICommand):
         if qlinear_encoder == "fpa4w" and device != "mps":
             raise ValueError("--qlinear_encoder=fpa4w can only be used when --device is set to 'mps'")
 
+        # Validate OpenVINO-native quantization constraints
+        openvino_quantization = getattr(self.args, "openvino_quantization", None)
+        if openvino_quantization:
+            if self.args.recipe != "openvino":
+                raise ValueError("--openvino_quantization can only be used with --recipe openvino")
+            if self.args.qlinear or self.args.qembedding:
+                raise ValueError(
+                    "--openvino_quantization is mutually exclusive with --qlinear and --qembedding. "
+                    "Use one quantization approach."
+                )
+
         kwargs = {}
         if self.args.use_custom_sdpa:
             kwargs["use_custom_sdpa"] = self.args.use_custom_sdpa
@@ -263,6 +291,9 @@ class ExecuTorchExportCommand(BaseOptimumCLICommand):
             kwargs["dtype"] = self.args.dtype
         if hasattr(self.args, "device") and self.args.device:
             kwargs["device"] = self.args.device
+        if openvino_quantization:
+            kwargs["openvino_quantization"] = openvino_quantization
+            kwargs["openvino_group_size"] = self.args.openvino_group_size
 
         main_export(
             model_name_or_path=self.args.model,

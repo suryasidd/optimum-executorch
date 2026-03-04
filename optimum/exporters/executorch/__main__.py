@@ -135,6 +135,11 @@ def main_export(
     logging.info(f"Loading {model_name_or_path} and exporting to static graph...")
     recipe_kwargs = kwargs.pop("recipe_kwargs", {})
 
+    _RECIPE_ONLY_KWARGS = ("openvino_quantization", "openvino_group_size")
+    for _k in _RECIPE_ONLY_KWARGS:
+        if _k in kwargs:
+            recipe_kwargs[_k] = kwargs.pop(_k)
+
     model = task_func(model_name_or_path, **kwargs)
 
     # 2. Export to ExecuTorch through ExecuTorch's lowering APIs.
