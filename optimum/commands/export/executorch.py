@@ -190,6 +190,12 @@ def parse_args_executorch(parser):
         help="Device to run the model on. Options: cpu, cuda, mps. Default: cpu.",
     )
     required_group.add_argument(
+        "--image_size",
+        type=int,
+        required=False,
+        help="Image size for object detection models. Required for object-detection task.",
+    )
+    required_group.add_argument(
         "--openvino_quantization",
         type=str,
         choices=["int4wo_sym", "int4wo_asym", "int8wo_sym", "int8wo_asym"],
@@ -291,6 +297,8 @@ class ExecuTorchExportCommand(BaseOptimumCLICommand):
             kwargs["dtype"] = self.args.dtype
         if hasattr(self.args, "device") and self.args.device:
             kwargs["device"] = self.args.device
+        if hasattr(self.args, "image_size") and self.args.image_size:
+            kwargs["image_size"] = self.args.image_size
         if openvino_quantization:
             kwargs["openvino_quantization"] = openvino_quantization
             kwargs["openvino_group_size"] = self.args.openvino_group_size
