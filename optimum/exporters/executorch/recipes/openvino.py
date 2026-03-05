@@ -108,7 +108,6 @@ def export_to_executorch_with_openvino(
         ]
         openvino_partitioner = OpenvinoPartitioner(
             compile_spec=compile_specs,
-            verbose=True,
         )
 
         et_prog = to_edge_transform_and_lower(
